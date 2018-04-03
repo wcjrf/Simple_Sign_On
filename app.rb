@@ -1,6 +1,12 @@
 require 'sinatra/reloader'
 require 'pry'
 require 'json'
+require 'net/http'
+require 'SQLite3'
+
+CLIENT_ID = ENV.fetch('PROCORE_CLIENT_ID')
+CLIENT_SECRET= ENV.fetch('PROCORE_CLIENT_SECRET'),
+REDIRECT_URL = ENV.fetch('PROCORE_OAUTH2_REDIRECT_URI')
 
 class App < Sinatra::Base
   set :sessions, true
@@ -24,7 +30,7 @@ class App < Sinatra::Base
   end
 
   def redirect_uri
-    ENV.fetch('PROCORE_OAUTH2_REDIRECT_URI') {'http://localhost:5000/callback'}
+    ENV.fetch('PROCORE_OAUTH2_REDIRECT_URI')
   end
 
   def authorized_api_request(path, query_string=nil)
@@ -39,8 +45,8 @@ class App < Sinatra::Base
     erb :home
   end
 
-  get '/sign_in' do
-    redirect client.auth_code.authorize_url(redirect_uri: redirect_uri)
+  get '/signin' do
+    erb :signin
   end
 
   get '/sign_out' do
@@ -50,11 +56,75 @@ class App < Sinatra::Base
   end
 
   get '/callback' do
-    token = client.auth_code.get_token(params[:code], redirect_uri: redirect_uri)
-    session[:access_token]  = token.token
-    session[:refresh_token] = token.refresh_token
-    erb :callback
+    # Pull the authorization code from the code parameter
+    authorization_code = params["code"]
+
+    # Exchange endpoint
+    uri = URI.parse("https://app.procore.com/oauth/token")
+
+    # Post to /oauth/token with required information
+    response = Net::HTTP::post_form(uri, {
+      "grant_type" => "authorization_code",
+      "client_id" => CLIENT_ID,
+      "client_secret" => CLIENT_SECRET,
+      "code" => authorization_code,
+      "redirect_uri" => REDIRECT_URL
+    })
+
+    # Parse JSON response
+    json = JSON.parse(response.body)
+
+    # Me Endpoint
+    me_uri = URI.parse("https://app.procore.com/vapid/me")
+    me_request = Net::HTTP::Get.new(me_uri)
+
+    # Set authorization header
+    me_request["authorization"] = "Bearer #{json['access_token']}"
+
+    me_response = Net::HTTP.start(me_uri.hostname, me_uri.port, use_ssl: true) do |http|
+      http.request(me_request)
+    end
+
+    # Parse response
+    me_json = JSON.parse(me_response.body)
+
+    # Establish connection to database
+    db = SQLite3::Database.new("test.db")
+
+    # Look up user by ProcoreID
+    user = db
+      .execute("select * from users where procore_id = ?", me_json["id"])
+      .first
+
+    # User does not exist - create them in the database
+    if user.nil?
+      db.execute(
+        "INSERT INTO users (procore_id, email) VALUES (?, ?)",
+        [me_json["id"], me_json["login"]]
+      )
+      session["user_id"] = db.last_insert_row_id
+    else
+      # User already exists, sign them in
+      session["user_id"] = user[0]
+    end
+
+    redirect to('/home')
   end
+
+  get '/home' do
+    # Open a connection to the database
+    db = SQLite3::Database.new("test.db")
+
+    # Pull the current user out of the database - user who’s id matches the id
+    # stored in the session
+    user = db
+      .execute("select * from users where id = ?", session["user_id"])
+      .first
+
+    # Print the user as a string for the browser
+    user.to_s
+  end
+
 
   get '/refresh' do
     token = access_token.refresh!
@@ -75,89 +145,44 @@ end
 
 __END__
 
-@@layout
-<!doctype html>
-<html class="no-js" lang="">
-    <head>
-      <meta charset="utf-8">
-      <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
-      <title>Oauth Sample Client</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <link rel="stylesheet" href="bootstrap.min.css" media="all" charset="utf-8">
-      <% if session[:access_token] %>
-        <script type="text/javascript">
-          var apiUrl = '<%= "#{ENV['PROCORE_API_URL']}" %>'
-          var authHeader = 'Bearer <%= session[:access_token] %>'
-        </script>
-        <!-- <script src="xmlhttp_request_example.js" charset="utf-8"></script> -->
-        <script src="fetch_example.js" charset="utf-8"></script>
-      <% end %>
-    </head>
-    <body>
-      <div class="container">
-        <div class="page-header clearfix">
-          <h3 class="text-muted">Procore Oauth Client App</h3>
-        </div>
-        <div>
-          <%= yield %>
-        </div>
-      </div>
-    </body>
-</html>
+@@index
+  <style>
+    .signup-form {
+      margin: 48px 0;
+      text-align: center;
+    }
 
+    a {
+      background-color: #f47e42;
+      color: #fff;
+      font-family: sans-serif;
+      padding: 12px;
+      text-decoration: none;
+    }
+  </style>
+  <div class="signup-form">
+    <a href='<%= "https://app.procore.com/oauth/authorize?client_id=#{CLIENT_ID}&response_type=code&redirect_uri=#{REDIRECT_URL}" %>'>
+      Sign Up with Procore
+    </a>
+  </div>
 
-@@callback
-<script type="text/javascript">
-  localStorage.setItem('accessToken', '<%= session[:access_token] %>')
-  localStorage.setItem('refreshToken', '<%= session[:refresh_token] %>')
-  localStorage.setItem('apiUrl', '<%= ENV['PROCORE_API_URL'] %>')
-  window.location = "/";
-</script>
+@@signin
+  <style>
+    .signin-form {
+      margin: 48px 0;
+      text-align: center;
+    }
 
-
-@@refresh
-<script type="text/javascript">
-  localStorage.setItem('accessToken', '<%= session[:access_token] %>')
-  localStorage.removeItem('refreshToken')
-  window.location = "/";
-</script>
-
-
-@@sign_out
-<script type="text/javascript">
-  console.log('signing out');
-  localStorage.removeItem('accessToken')
-  localStorage.removeItem('refreshToken')
-  window.location = "/";
-</script>
-
-
-@@home
-<div class="grid">
-  <% if session[:access_token] %>
-    access token <pre><%= session[:access_token] %></pre>
-    refresh token <pre><a href='/refresh'><%= session[:refresh_token] %></a></pre>
-    <a href='/sign_out' class='button btn btn-large btn-block btn-warning'>Sign Out</a>
-    <br>
-    <fieldset>
-      <legend>Initate a CORS api request from this browser</legend>
-      <%= client.site %>/vapid/companies:
-      <pre  id='api-log'>
-        <code class='lang-js'></code>
-      </pre>
-    </fieldset>
-    <fieldset>
-      <legend>Initiate an authorized api calls from server:</legend>
-      <ul class='list'>
-        <li>
-          <a href='/api/vapid/companies'>/api/vapid/companies</a>
-        </li>
-        <li>
-          <a href='/api/oauth/token/info'>/api/oauth/tokens/info</a>
-        </li>
-      </ul>
-    </fieldset>
-  <% else %>
-    <a href='/sign_in' class='button btn btn-large btn-block btn-primary'>Sign In</a>
-  <% end %>
-</div>
+    a {
+      background-color: #f47e42;
+      color: #fff;
+      font-family: sans-serif;
+      padding: 12px;
+      text-decoration: none;
+    }
+  </style>
+  <div class="signin-form">
+    <a href='<%= "https://app.procore.com/oauth/authorize?client_id=#{CLIENT_ID}&response_type=code&redirect_uri=#{REDIRECT_URL}" %>'>
+        Sign In with Procore
+    </a>
+  </div>

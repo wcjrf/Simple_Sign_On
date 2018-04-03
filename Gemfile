@@ -7,6 +7,8 @@ gem "puma"
 gem "oauth2"
 gem "dotenv"
 gem "httparty"
+gem "net/http"
+gem "SQLite3"
 
 group :development do
   gem "pry"
